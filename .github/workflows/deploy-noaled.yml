@@ -1,0 +1,47 @@
+name: Deploy with Docker Compose
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_DIR: /home/${{ secrets.REMOTE_USER }}/keygen
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Copy compose file to remote server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          source: docker-compose.noaled.yaml
+          target: ${{ env.DEPLOY_DIR }}
+
+      - name: Deploy on remote server
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_DIR: ${{ env.DEPLOY_DIR }}
+          DOT_ENV: ${{ secrets.DOT_ENV }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.REMOTE_HOST }}
+          username: ${{ secrets.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: DEPLOY_DIR,DOT_ENV,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -e
+            cd "$DEPLOY_DIR"
+            (umask 077 && printf '%s' "$DOT_ENV" | base64 -d > .env)
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            docker compose -f docker-compose.noaled.yaml pull
+            docker compose -f docker-compose.noaled.yaml run --rm keygen-migrate
+            docker compose -f docker-compose.noaled.yaml up -d --remove-orphans
+            docker image prune -f

@@ -1,0 +1,104 @@
+services:
+  keygen-setup:
+    profiles: [ "setup" ]
+    image: keygen/api:latest
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@keygen-postgres:5432/${POSTGRES_DB}"
+      DISABLE_DATABASE_ENVIRONMENT_CHECK: 1
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        until pg_isready -h keygen-postgres -U ${POSTGRES_USER}; do
+          echo 'Waiting for PostgreSQL...'
+          sleep 1
+        done
+        bundle exec rails keygen:setup
+      "
+    depends_on: [ keygen-postgres ]
+    tty: true
+    stdin_open: true
+
+  keygen-console:
+    profiles: [ "console" ]
+    image: keygen/api:latest
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@keygen-postgres:5432/${POSTGRES_DB}"
+    env_file:
+      - .env
+    command: bundle exec rails console
+    depends_on: [ keygen-postgres ]
+    tty: true
+    stdin_open: true
+
+  keygen-migrate:
+    profiles: [ "migrate" ]
+    image: keygen/api:latest
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@keygen-postgres:5432/${POSTGRES_DB}"
+    env_file:
+      - .env
+    command: bundle exec rails db:migrate
+    depends_on: [ keygen-postgres ]
+
+  keygen-postgres:
+    image: postgres:17.5
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+
+  keygen-redis:
+    image: redis
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+
+  keygen-api:
+    image: keygen/api:latest
+    restart: unless-stopped
+    networks:
+      - default
+      - app
+    command: "web"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@keygen-postgres:5432/${POSTGRES_DB}"
+    volumes:
+      - keygen:/etc/keygen
+    depends_on:
+      - keygen-postgres
+      - keygen-redis
+
+  keygen-worker:
+    image: keygen/api:latest
+    restart: unless-stopped
+    command: "worker"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@keygen-postgres:5432/${POSTGRES_DB}"
+    volumes:
+      - keygen:/etc/keygen
+    depends_on:
+      - keygen-postgres
+      - keygen-redis
+
+  keygen-portal:
+    image: ghcr.io/noaled-lab/keygen-portal:latest
+    restart: unless-stopped
+    networks:
+      - app
+
+networks:
+  app:
+    external: true
+
+volumes:
+  keygen:
+  postgres:
+  redis:
