@@ -1,266 +1,113 @@
-<a href="https://keygen.sh?ref=keygen-api">
-  <div>
-    <img src="https://keygen.sh/images/logo-pill.png" width="200" alt="Keygen">
-  </div>
-</a>
-<br>
+# Keygen API (self-hosted fork)
 
-[![Keygen CI](https://github.com/keygen-sh/keygen-api/actions/workflows/test.yml/badge.svg)](https://github.com/keygen-sh/keygen-api/actions)
-[![Discord Community](https://img.shields.io/badge/discord-community-blue)][discord]
+[keygen-sh/keygen-api](https://github.com/keygen-sh/keygen-api)를 Docker Compose로 셀프 호스팅하기 위한 포크입니다.
+원본 README는 [README.old.md](README.old.md)에 보관되어 있습니다.
 
-# Keygen
+아래에서 `<...>`로 표시된 값은 각 환경에 맞게 바꿔서 사용합니다.
 
-Keygen is a fair source software licensing and distribution API, built
-for developers, by developers. Use Keygen to add license key validation,
-entitlements, and device activation to your business's desktop apps,
-server applications, on-premise software, and other products.
+## 관련 파일
 
-## Software licensing for everyone
+| 파일 | 설명 |
+| --- | --- |
+| [`docker-compose.noaled.yaml`](docker-compose.noaled.yaml) | 운영 compose (api, worker, postgres, redis, portal + setup/console/migrate 프로필) |
+| [`noaled.env.example`](noaled.env.example) | 서버 `.env` 템플릿 |
+| [`.github/workflows/deploy-noaled.yml`](.github/workflows/deploy-noaled.yml) | 배포 워크플로 (수동 실행) |
+| [`.github/workflows/test.yml`](.github/workflows/test.yml) | 원본 CI (push/PR 시 자동 실행) |
 
-Keygen comes in two editions. Keygen CE is our Community Edition, and is
-free (as in beer) to self-host for personal and commercial use. Keygen
-EE is our Enterprise Edition, and it requires a license key to use.
-Keygen EE comes with dedicated support, as well as enterprise-grade features
-like request logs, audit logs, permissions, environments, and more.
+## 구성
 
-We built Keygen to make software licensing accessible to everyone.
-
-## Managed hosting with Keygen Cloud
-
-The easiest way to get started with Keygen is with [our official managed
-service in the cloud][keygen-cloud]. We'll handle the hard stuff — high
-availability, backups, security, and maintenance — while you focus on
-product.
-
-Our managed hosting can save a substantial amount of developer time and
-resources. For most businesses, this ends up being the best value
-option and the revenue goes to funding the maintenance and further
-development of Keygen. So you’ll be supporting [Fair Source](https://fair.io)
-software and getting a great service!
-
-## Self hosting with Keygen CE
-
-Keygen is a fair source software licensing and distribution API, and we have a
-free (as in beer) [self-hosted solution][self-hosting]. Keygen Community
-Edition (CE) is exactly the same code base as our managed solution, Keygen
-Cloud, but with a less frequent release schedule (think of it as an LTS
-release).
-
-Bug fixes and new features are released to Keygen Cloud several times
-per week. Features are battle-tested in Keygen Cloud, which allows us to fix
-any bugs before the general self-hosted release. Every 6 months or so, we
-combine all the changes into a new self-hosted release.
-
-Keygen CE does lack a few features from Keygen Cloud, most of which are
-available in Keygen EE.
-
-Interested in self-hosting Keygen? Take a look at our [self-hosting docs][self-hosting].
-
-## Self hosting with Keygen EE
-
-Keygen is also enterprise-grade, and battle-tested in Keygen Cloud with some of
-the best brands in the world. The following features are available in
-Keygen Enterprise Edition (EE):
-
-- **Request logs**: keep a historical record of API requests, along with who
-  made the request, the request body, response body, status code, IP address,
-  and other information.
-- **Event logs**: keep an audit trail of every single event that happens on a
-  Keygen account.
-- **Environments**: manage separate environments within a Keygen account, from
-  test environments, to a sandbox, to QA, to production.
-- **Permissions**: enterprise-grade roles and permissions.
-- **Import/export**: migrate from Keygen Cloud to Keygen EE (and vice-versa).
-- **OCI/Docker**: license and distribute private container images via Keygen's
-  license-gated, OCI-compliant container registry.
-- **SSO/SAML**: support for SSO/SAML.
-
-In addition, Keygen EE customers are entitled to dedicated self-hosting
-support. We're here to make sure you're successful.
-
-Keygen uses Keygen EE in production to run Keygen Cloud, which is used to
-license Keygen EE. It's ~~turtles~~ Keygens all the way down (we love
-dogfooding our own products).
-
-To obtain a license key, please [reach out][sales].
-
-## Sustainability
-
-Our only sources of funding for Keygen is our premium, managed service for
-running Keygen in the Cloud, and Keygen EE. But if you're looking for an
-alternative way to support the project, we've put together [some
-sponsorship options][sponsor].
-
-If you choose to self-host Keygen CE, you can [become a sponsor][sponsor],
-which is a great way to give back to the community and to contribute
-to the long-term sustainability of the project.
-
-## Support
-
-Keygen CE is a community supported project and there are **no guarantees** that
-you will receive support from the creators of Keygen to troubleshoot your
-self-hosting issues. Keygen offers **best-effort** support for Keygen CE. There
-is [a community-supported Discord server][discord] and [a forum][forum] where
-you can ask for help with self-hosting.
-
-If you do need support guantantees, consider becoming a [Keygen Cloud][keygen-cloud]
-customer, or [purchasing Keygen EE][sales].
-
-## Developing
-
-### Secrets
-
-To generate a [secret key](https://guides.rubyonrails.org/security.html) for
-the application, run:
-
-```bash
-export SECRET_KEY_BASE="$(openssl rand -hex 64)"
+```
+인터넷 ─▶ 리버스 프록시 (외부 네트워크 app)
+            ├─ <portal 도메인>  ─▶ keygen-portal (80)
+            └─ <api 도메인>     ─▶ keygen-api (PORT, 기본 3000)
+                                     ├─ keygen-postgres
+                                     └─ keygen-redis
+                                  keygen-worker (sidekiq)
 ```
 
-To generate [at-work encryption](https://guides.rubyonrails.org/active_record_encryption.html) secrets, run:
+- 리버스 프록시는 이 저장소 밖에서 관리하며, 외부 Docker 네트워크 `app`을 미리 만들어 둬야 합니다.
+- `keygen-api`, `keygen-portal`만 `app` 네트워크에 붙습니다. 컨테이너 이름은 `<project>-keygen-api-1` 형태가 됩니다.
+- portal 이미지는 비공개 GHCR 이미지이고, 나머지는 Docker Hub 공개 이미지입니다.
+- portal은 빌드 시점에 API 호스트, edition/mode, account ID가 고정됩니다. 서버 `.env`의 값과 일치해야 합니다.
+
+## 배포
+
+GitHub Actions → **Deploy with Docker Compose** → **Run workflow** (수동 실행만 가능).
+
+워크플로가 하는 일:
+
+1. `docker-compose.noaled.yaml`을 서버 `/home/<REMOTE_USER>/keygen`으로 복사
+2. `DOT_ENV` 시크릿을 base64 디코드해서 `.env` 생성 (권한 600)
+3. `GITHUB_TOKEN`으로 `ghcr.io` 로그인
+4. `pull` → `run --rm keygen-migrate` → `up -d --remove-orphans` → `image prune`
+
+### 필요한 Repository Secrets
+
+| Secret | 설명 |
+| --- | --- |
+| `REMOTE_HOST` | 서버 주소 |
+| `REMOTE_USER` | SSH 사용자 (배포 경로가 `/home/<REMOTE_USER>/keygen`이 됨) |
+| `REMOTE_SSH_KEY` | SSH 개인키 |
+| `DOT_ENV` | 서버 `.env` 전체를 base64 인코딩한 값 (`base64 -w0 .env`) |
+
+`.env`는 `noaled.env.example`을 복사해서 채웁니다. `KEYGEN_ACCOUNT_ID`는 portal 빌드에 들어간 ID와 같아야 합니다.
+
+## 최초 설치 (DB가 비어 있을 때 1회)
+
+배포 워크플로는 `migrate`만 실행하고 **계정 생성(`keygen:setup`)은 하지 않습니다.**
+새 DB에서는 API가 `Account ... does not exist (run rake keygen:setup to create it)`를 출력하며 재시작을 반복하므로,
+서버에서 직접 한 번 실행해야 합니다.
 
 ```bash
-export ENCRYPTION_DETERMINISTIC_KEY="$(openssl rand -base64 32)"
-export ENCRYPTION_PRIMARY_KEY="$(openssl rand -base64 32)"
-export ENCRYPTION_KEY_DERIVATION_SALT="$(openssl rand -base64 32)"
+cd /home/<REMOTE_USER>/keygen
+docker compose -f docker-compose.noaled.yaml stop keygen-api keygen-worker
+docker compose -f docker-compose.noaled.yaml --profile setup run --rm keygen-setup
+docker compose -f docker-compose.noaled.yaml up -d
+curl -s https://<api 도메인>/v1/ping
 ```
 
-### Setup
+- `.env`의 `KEYGEN_ACCOUNT_ID`, `KEYGEN_ADMIN_EMAIL`, `KEYGEN_ADMIN_PASSWORD`로 계정을 만듭니다 (없으면 TTY로 물어봄).
+- ⚠️ `keygen:setup`은 내부적으로 `db:schema:load`를 실행해 **DB를 초기화**합니다. 데이터가 있는 DB에서는 절대 다시 실행하지 마세요.
 
-To install dependencies, run:
+## 운영 명령
+
+root로 접속했다면 `~`가 `/root`이므로 반드시 절대 경로로 이동합니다.
 
 ```bash
-bundle
+cd /home/<REMOTE_USER>/keygen
+docker compose -f docker-compose.noaled.yaml ps -a
+docker compose -f docker-compose.noaled.yaml logs --tail=100 keygen-api
+docker compose -f docker-compose.noaled.yaml logs --tail=100 keygen-worker
+docker compose -f docker-compose.noaled.yaml --profile console run --rm keygen-console   # rails console
+docker compose -f docker-compose.noaled.yaml --profile migrate run --rm keygen-migrate   # 마이그레이션
 ```
 
-To setup Keygen, run:
+## 트러블슈팅
 
-```bash
-bundle exec rails keygen:setup
-```
+### 배포 시 `keygen-portal Error denied` / `Error response from daemon: denied`
 
-### Seeding
+`GITHUB_TOKEN`은 접근 권한이 부여된 패키지만 읽을 수 있습니다. portal 패키지가 다른 저장소에서 올라간 것이면 기본적으로 이 저장소의 토큰으로는 pull이 거부됩니다.
+portal 이미지 pull이 실패하면 나머지도 `Interrupted`되고 `set -e`로 배포 전체가 중단됩니다.
 
-To seed the database with sample data, run (optional):
+- 해결: GitHub 조직의 **Packages → (portal 패키지) → Package settings → Manage Actions access**에 이 저장소를 **Read** 권한으로 추가.
+- 대안: `read:packages` 권한의 PAT를 시크릿으로 등록해 `GHCR_TOKEN`으로 사용.
+- 참고: `GITHUB_TOKEN`은 워크플로 종료 후 만료되므로, 서버에서 나중에 수동으로 portal 이미지를 pull해야 한다면 PAT 방식이 안정적입니다.
 
-```bash
-bundle exec rails db:seed:development
-```
+### Portal에서 이메일 입력 후 "Service is unavailable."
 
-### Running
+portal은 API 호출이 실패하면 이 문구를 보여줍니다. 대부분 API 쪽 문제입니다.
 
-To start the server, run:
+1. `curl -i https://<api 도메인>/v1/ping` → `502 Bad Gateway`면 프록시 뒤의 `keygen-api`가 떠 있지 않은 것.
+2. `docker network inspect app`에 keygen-api 컨테이너가 있는지 확인.
+3. `ps -a` / `logs keygen-api`로 상태 확인:
+   - 컨테이너가 없음 → 배포가 `pull`에서 실패해 `up`까지 못 감 (위 GHCR 항목 참고).
+   - `Account ... does not exist`로 재시작 반복 → [최초 설치](#최초-설치-db가-비어-있을-때-1회) 진행.
+   - 정상 기동 중 → 프록시의 `proxy_pass` 대상(컨테이너명/`PORT`) 확인.
 
-```bash
-bundle exec rails server
-```
+### `keygen-worker`가 `Restarting`
 
-To start a worker, run:
+대부분 API와 같은 원인(계정 미생성, `.env` 누락)입니다. `logs keygen-worker`로 확인하세요.
 
-```bash
-bundle exec sidekiq
-```
+## 개발 / 테스트
 
-To start a console, run:
-
-```bash
-bundle exec rails console
-```
-
-### Testing
-
-To setup the test environment, run:
-
-```bash
-bundle exec rake test:setup
-```
-
-To run the entire test suite, specs and features, run (takes ~20 mins on a 16-core CPU):
-
-```bash
-bundle exec rake test
-```
-
-To run Cucumber features, run:
-
-```bash
-bundle exec rake test:cucumber
-bundle exec rake test:cucumber[features/api/v1/licenses/actions/validations.feature:369]
-bundle exec rake test:cucumber[features/api/v1/licenses/actions/validations.feature]
-bundle exec rake test:cucumber[features/api/v1/licenses]
-```
-
-To run Rspec specs, run:
-
-```bash
-bundle exec rake test:rspec
-bundle exec rake test:rspec[spec/models/license_spec.rb:199]
-bundle exec rake test:rspec[spec/models/license_spec.rb]
-bundle exec rake test:rspec[spec/models]
-```
-
-## License
-
-Keygen is licensed under the [Fair Core License](https://fcl.dev). The Fair
-Core License, or FCL, provides the best balance between user freedom and
-developer sustainability for a project like Keygen that monetizes via SaaS and
-self-hosting. The FCL is a mostly-permissive non-compete [Fair Source](https://fair.io)
-license that eventually contributes to Open Source after 2 years.
-
-The 2-year timeframe applies to each software version made available, whether
-through pushing a Git commit, tagging a release on GitHub, or publishing an
-image to Docker Hub. After 2 years, the code licensed under the FCL becomes
-Open Source under the Apache 2.0 license.
-
-To obtain an Open Source version of Keygen, run the following:
-
-```bash
-git clone https://github.com/keygen-sh/keygen-api && cd keygen-api
-git checkout `git rev-list -n 1 --before='2 years ago' master`
-```
-
-If the `LICENSE.md` file is FCL, and that code is 2 years old, you may use that
-version under the Open Source terms of the change license, which is currently
-the Apache 2.0 license.
-
-You can...
-
-1. self-host Keygen EE to license your enterprise applications.
-2. embed Keygen CE in your on-premise applications.
-3. run Keygen CE on a private network.
-3. modify Keygen to add additional functionality.
-4. fork Keygen into a private repo.
-
-If the FCL happens to not work for your company or use-case, please [reach out][sales].
-
-The license is available [here](https://keygen.sh/license/).
-
-## Contributing
-
-If you discover an issue, or are interested in a new feature, please open an
-issue. If you want to contribute code, feel free to open a pull request. If the
-PR is substantial, it may be beneficial to open an issue beforehand to discuss.
-
-The CLA is available [here](https://keygen.sh/cla/).
-
-## Security
-
-We take security at Keygen very seriously. We try to perform annual pen-tests
-on our code base and infrastructure. In addition, we regularly perform both
-internal and external code audits.
-
-If you believe you've found a vulnerability, please see our [`SECURITY.md`](https://github.com/keygen-sh/keygen-api/blob/master/SECURITY.md)
-file.
-
-## Is it any good?
-
-[Yes.](https://news.ycombinator.com/item?id=3067434)
-
-[keygen-cloud]: https://keygen.sh
-[self-hosting]: https://keygen.sh/docs/self-hosting/
-[sponsor]: https://github.com/sponsors/ezekg
-[support]: mailto:support@keygen.sh
-[discord]: https://discord.gg/TRrhSaWSsN
-[forum]: https://github.com/keygen-sh/community/discussions
-[license]: https://keygen.sh/license/
-[sales]: mailto:sales@keygen.sh
+테스트 실행 방법과 규칙은 [AGENTS.md](AGENTS.md)를 참고하세요. 항상 `bundle exec rake test:*`로 실행합니다.
