@@ -1,0 +1,27 @@
+#!/bin/bash
+# keygen-backup 컨테이너의 시작 명령. Postgres를 기다린 뒤, 백업이 하나도 없으면 바로 전체 백업을 한 번 하고
+# BACKUP_SCHEDULE(cron 식, 기본 매일 03:00)마다 keygen-backup을 실행한다.
+set -euo pipefail
+
+schedule="${BACKUP_SCHEDULE:-0 3 * * *}"
+tz="${BACKUP_TZ:-UTC}"
+export TZ="$tz"
+
+# 설정이 빠졌으면 바로 알린다 (walg 래퍼가 빠진 이름을 출력한다).
+walg --version >/dev/null
+
+echo "keygen-backup: Postgres(${PGHOST:-local}) 연결을 기다립니다"
+until pg_isready -q; do sleep 2; done
+
+# 이 DB의 백업이 아직 없으면(처음 적용, 새 경로) 바로 전체 백업을 한다.
+# 다른 DB의 백업만 있는 경로면 keygen-backup이 실패하고 알린다.
+cluster_id="$(psql -Atc "select system_identifier from pg_control_system()")"
+if ! walg backup-list --detail --json 2>/dev/null | grep -q "\"system_identifier\":${cluster_id}[,}]"; then
+  echo "keygen-backup: 이 DB의 백업이 아직 없어 전체 백업을 먼저 합니다"
+  /usr/local/bin/keygen-backup full || echo "keygen-backup: 첫 전체 백업 실패. 예약 시각에 다시 시도합니다" >&2
+fi
+
+crontab="$(mktemp)"
+printf 'CRON_TZ=%s\n%s /usr/local/bin/keygen-backup auto\n' "$tz" "$schedule" > "$crontab"
+echo "keygen-backup: 예약 '$schedule' ($tz)"
+exec /usr/local/bin/supercronic -passthrough-logs "$crontab"

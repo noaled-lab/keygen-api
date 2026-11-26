@@ -11,7 +11,10 @@
 | --- | --- |
 | [`docker-compose.noaled.yaml`](docker-compose.noaled.yaml) | 운영 compose (api, worker, postgres, redis, portal + setup/console/migrate 프로필) |
 | [`noaled.env.example`](noaled.env.example) | 서버 `.env` 템플릿 |
+| [`backup.env.example`](backup.env.example) | 서버 `.env.backup` 템플릿 (DB 백업: S3 · 암호화 · 일정 · 알림) |
+| [`BACKUP.md`](BACKUP.md) | DB 백업 (WAL-G → RustFS) 구성 · 처음 적용 · 복원 |
 | [`.github/workflows/deploy-noaled.yml`](.github/workflows/deploy-noaled.yml) | 배포 워크플로 (수동 실행) |
+| [`.github/workflows/build-postgres.yml`](.github/workflows/build-postgres.yml) | Postgres + WAL-G 이미지 빌드 (`backup/postgres` 변경 시) |
 | [`.github/workflows/test.yml`](.github/workflows/test.yml) | 원본 CI (push/PR 시 자동 실행) |
 
 ## 구성
@@ -20,9 +23,10 @@
 인터넷 ─▶ 리버스 프록시 (외부 네트워크 app)
             ├─ <portal 도메인>  ─▶ keygen-portal (80)
             └─ <api 도메인>     ─▶ keygen-api (PORT, 기본 3000)
-                                     ├─ keygen-postgres
+                                     ├─ keygen-postgres ── WAL · 백업 ─▶ RustFS (S3)
                                      └─ keygen-redis
                                   keygen-worker (sidekiq)
+                                  keygen-backup (예약 백업, BACKUP.md)
 ```
 
 - 리버스 프록시는 이 저장소 밖에서 관리하며, 외부 Docker 네트워크 `app`을 미리 만들어 둬야 합니다.
@@ -37,7 +41,7 @@ GitHub Actions → **Deploy with Docker Compose** → **Run workflow** (수동 �
 워크플로가 하는 일:
 
 1. `docker-compose.noaled.yaml`을 서버 `/home/<REMOTE_USER>/keygen`으로 복사
-2. `DOT_ENV` 시크릿을 base64 디코드해서 `.env` 생성 (권한 600)
+2. `DOT_ENV`·`DOT_ENV_BACKUP` 시크릿을 base64 디코드해서 `.env`·`.env.backup` 생성 (권한 600)
 3. `GITHUB_TOKEN`으로 `ghcr.io` 로그인
 4. `pull` → `run --rm keygen-migrate` → `up -d --remove-orphans` → `image prune`
 
@@ -49,6 +53,7 @@ GitHub Actions → **Deploy with Docker Compose** → **Run workflow** (수동 �
 | `REMOTE_USER` | SSH 사용자 (배포 경로가 `/home/<REMOTE_USER>/keygen`이 됨) |
 | `REMOTE_SSH_KEY` | SSH 개인키 |
 | `DOT_ENV` | 서버 `.env` 전체를 base64 인코딩한 값 (`base64 -w0 .env`) |
+| `DOT_ENV_BACKUP` | 서버 `.env.backup` 전체를 base64 인코딩한 값 (`base64 -w0 .env.backup`). 없으면 배포가 멈춤 ([BACKUP.md](BACKUP.md)) |
 
 `.env`는 `noaled.env.example`을 복사해서 채웁니다. `KEYGEN_ACCOUNT_ID`는 portal 빌드에 들어간 ID와 같아야 합니다.
 

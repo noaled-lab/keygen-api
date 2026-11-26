@@ -1,0 +1,32 @@
+#!/bin/bash
+# 비어 있는 데이터 폴더에 백업을 받아 복구 준비를 한다. 그다음 Postgres를 시작하면 WAL을 받아 복구를 마친다.
+#   keygen-restore                         최신 백업 + 받을 수 있는 마지막 WAL까지
+#   keygen-restore LATEST "2026-11-26 14:30:00+09"   그 시각 직전까지 (시점 복원)
+#   keygen-restore base_0000000100000000000000A1      특정 백업 (walg backup-list로 이름 확인)
+# 복원 시험에서는 Postgres를 archive_mode=off로 띄워, 복원한 DB가 운영 저장소에 WAL을 올리지 않게 한다.
+set -euo pipefail
+
+backup="${1:-LATEST}"
+target_time="${2:-}"
+data_dir="${PGDATA:-/var/lib/postgresql/data}"
+
+if [ -n "$(ls -A "$data_dir" 2>/dev/null)" ]; then
+  echo "keygen-restore: $data_dir 가 비어 있지 않습니다. 빈 볼륨에만 복원합니다." >&2
+  exit 1
+fi
+
+walg backup-fetch "$data_dir" "$backup"
+
+{
+  echo ""
+  echo "# keygen-restore $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  echo "restore_command = 'walg wal-fetch %f %p'"
+  if [ -n "$target_time" ]; then
+    echo "recovery_target_time = '$target_time'"
+    echo "recovery_target_action = 'promote'"
+  fi
+} >> "$data_dir/postgresql.auto.conf"
+touch "$data_dir/recovery.signal"
+chmod 700 "$data_dir"
+
+echo "keygen-restore: $backup 를 받았습니다${target_time:+ (목표 시각 $target_time)}. 이제 Postgres를 시작하면 복구를 마칩니다."

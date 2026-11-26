@@ -41,15 +41,45 @@ services:
     command: bundle exec rails db:migrate
     depends_on: [ keygen-postgres ]
 
+  # postgres:17.5 + WAL-G (backup/postgres/Dockerfile). WAL을 S3(RustFS)에 올린다.
+  # 백업 설정은 전부 .env.backup에 있다 (BACKUP.md).
   keygen-postgres:
-    image: postgres:17.5
+    image: ghcr.io/noaled-lab/keygen-postgres:17.5-walg3.0.9
     restart: unless-stopped
+    env_file:
+      - .env.backup
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    # archive_timeout: 바뀐 게 있으면 늦어도 5분 안에 WAL을 올린다 (시점 복원은 마지막으로 올라간 WAL까지만 된다).
+    command:
+      - postgres
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=300
+      - -c
+      - archive_command=walg wal-push %p
     volumes:
       - postgres:/var/lib/postgresql/data
+
+  # 예약 백업 (기본 매일 03:00, 일요일 전체 · 나머지 증분). 데이터 폴더는 읽기 전용으로만 본다.
+  keygen-backup:
+    image: ghcr.io/noaled-lab/keygen-postgres:17.5-walg3.0.9
+    restart: unless-stopped
+    user: postgres
+    entrypoint: [ "keygen-backup-schedule" ]
+    env_file:
+      - .env.backup
+    environment:
+      PGHOST: keygen-postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    volumes:
+      - postgres:/var/lib/postgresql/data:ro
+    depends_on: [ keygen-postgres ]
 
   keygen-redis:
     image: redis
