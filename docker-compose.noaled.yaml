@@ -41,20 +41,20 @@ services:
     command: bundle exec rails db:migrate
     depends_on: [ keygen-postgres ]
 
-  # 공식 postgres:17.5 + WAL-G 실행 파일. WAL을 S3(RustFS)에 올린다. 설정은 .env.backup (README "DB 백업").
+  # 공식 postgres:17.5 + WAL-G 실행 파일(체크섬 고정). WAL을 S3(RustFS)에 올린다. 설정은 .env.backup (README "DB 백업").
   keygen-postgres:
-    image: keygen-postgres:17.5-walg3.0.9
+    image: keygen-postgres:17.5-walg3.0.10
     build:
       dockerfile_inline: |
         FROM postgres:17.5
         ARG TARGETARCH
         RUN set -eux; \
-            apt-get update; apt-get install -y --no-install-recommends ca-certificates curl; rm -rf /var/lib/apt/lists/*; \
+            apt-get update; apt-get install -y --no-install-recommends ca-certificates curl jq; rm -rf /var/lib/apt/lists/*; \
             case "$$TARGETARCH" in \
-              amd64) f=wal-g-pg-22.04-amd64;   sha=d6795c663894d836ba20840bffe8970aed81bbe25d3151bd4951f6f9c362def9 ;; \
-              arm64) f=wal-g-pg-22.04-aarch64; sha=072eb4a4a119f817e1fa888c64a776b01e3453b2e0d967a67d149adb18fde652 ;; \
+              amd64) f=wal-g-pg-22.04-amd64;   sha=ef16ca5fc079feab65c79cfdb75d80ce0d84622a3ab25b1fd2c8a3b9f1e0d9e5 ;; \
+              arm64) f=wal-g-pg-22.04-aarch64; sha=b137200f2adef0787ac5b460d0c2be56be0284811bbb42f5f8819daa82058223 ;; \
             esac; \
-            curl -fsSL -o /usr/local/bin/wal-g "https://github.com/wal-g/wal-g/releases/download/v3.0.9/$$f"; \
+            curl -fsSL -o /usr/local/bin/wal-g "https://github.com/wal-g/wal-g/releases/download/v3.0.10/$$f"; \
             echo "$$sha  /usr/local/bin/wal-g" | sha256sum -c -; \
             chmod 755 /usr/local/bin/wal-g
     restart: unless-stopped
@@ -64,15 +64,17 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    # WAL-G 문서 방식: archive_command = wal-g wal-push %p (멈춰도 10분 뒤 끊기도록 timeout).
     # 바뀐 게 있으면 늦어도 5분(archive_timeout) 안에 WAL을 올린다.
-    command: [ "postgres", "-c", "archive_mode=on", "-c", "archive_timeout=300", "-c", "archive_command=wal-g wal-push %p" ]
+    command: [ "postgres", "-c", "archive_mode=on", "-c", "archive_timeout=300", "-c", "archive_command=timeout 600 wal-g wal-push %p" ]
     volumes:
       - postgres:/var/lib/postgresql/data
 
-  # 매일 BACKUP_TIME에 백업 (BACKUP_FULL_WEEKDAY는 전체, 나머지는 증분) → 오래된 백업 정리 → 웹훅 알림.
-  # 백업이 하나도 없으면 시작하자마자 전체 백업을 한다. 데이터 폴더는 읽기 전용으로만 본다.
+  # 매일 BACKUP_TIME에 backup-push (WALG_DELTA_MAX_STEPS만큼 증분 뒤 자동으로 전체) → delete retain FULL → 웹훅 알림.
+  # 5분마다 WAL 업로드 실패(pg_stat_archiver)와 BACKUP_MAX_AGE_HOURS 넘게 백업이 없는지 확인해 알린다.
+  # 백업이 하나도 없으면 시작하자마자 백업한다. 데이터 폴더는 읽기 전용으로만 본다.
   keygen-backup:
-    image: keygen-postgres:17.5-walg3.0.9
+    image: keygen-postgres:17.5-walg3.0.10
     pull_policy: never   # keygen-postgres가 빌드한 이미지를 같이 쓴다 (레지스트리에 없음)
     restart: unless-stopped
     user: postgres
@@ -89,27 +91,55 @@ services:
     entrypoint: [ "bash", "-c" ]
     command:
       - |
+        log() { echo "$$(date '+%F %T') $$1"; }
         notify() {
+          log "$$1"
           [ -n "$${BACKUP_WEBHOOK_URL:-}" ] || return 0
-          curl -fsS -m 15 -H 'Content-Type: application/json' -d "{\"text\": \"$$1\"}" "$$BACKUP_WEBHOOK_URL" >/dev/null || echo "알림 전송 실패"
+          jq -nc --arg t "[$${BACKUP_LABEL:-keygen}] $$1" '{text: $$t}' |
+            curl -fsS -m 15 -H 'Content-Type: application/json' -d @- "$$BACKUP_WEBHOOK_URL" >/dev/null || log "알림 전송 실패"
         }
         backup() {
-          echo "$$(date '+%F %T') $$1 백업 시작"
-          if wal-g backup-push "$$PGDATA" $$2 && wal-g delete retain FULL "$${BACKUP_RETAIN_FULL:-4}" --confirm; then
-            echo "$$(date '+%F %T') $$1 백업 성공"; notify "✅ Keygen DB $$1 백업 성공"
+          log "백업 시작"
+          if wal-g backup-push "$$PGDATA" --wait-for-archive && wal-g delete retain FULL "$${BACKUP_RETAIN_FULL:-4}" --confirm; then
+            notify "✅ DB 백업 성공 ($$(wal-g backup-list 2>/dev/null | awk 'END {print $$1}'))"
           else
-            echo "$$(date '+%F %T') $$1 백업 실패"; notify "❌ Keygen DB $$1 백업 실패 (docker compose logs keygen-backup)"
+            notify "❌ DB 백업 실패 (docker compose logs keygen-backup)"
           fi
         }
+        check_archive() {   # 마지막 실패가 마지막 성공보다 늦으면 지금 WAL을 못 올리고 있는 것
+          r=$$(psql -XAt -F ' ' -c "select coalesce(last_failed_time > coalesce(last_archived_time, '-infinity'), false), failed_count, coalesce(last_failed_wal, '-') from pg_stat_archiver") || { log "pg_stat_archiver 조회 실패"; return; }
+          set -- $$r
+          if [ "$$1" = t ]; then
+            [ -n "$$archive_bad" ] || notify "❌ WAL 업로드 실패 중 (누적 $$2회, $$3). docker compose logs keygen-postgres"
+            archive_bad=1
+          elif [ -n "$$archive_bad" ]; then
+            notify "✅ WAL 업로드 다시 정상"; archive_bad=
+          fi
+        }
+        check_stale() {
+          last=$$(wal-g backup-list --json --detail 2>/dev/null | jq -r '[.[]?.finish_time] | max // empty')
+          [ -z "$$last" ] || last=$$(date -d "$$last" '+%F %T')
+          if [ -z "$$last" ] || [ $$(( $$(date +%s) - $$(date -d "$$last" +%s) )) -gt $$(( $${BACKUP_MAX_AGE_HOURS:-26} * 3600 )) ]; then
+            [ -n "$$stale" ] || notify "❌ $${BACKUP_MAX_AGE_HOURS:-26}시간 넘게 성공한 백업 없음 (마지막: $${last:-없음/조회 실패})"
+            stale=1
+          elif [ -n "$$stale" ]; then
+            notify "✅ 백업 다시 최신 ($$last)"; stale=
+          fi
+        }
+        next_run() {
+          n=$$(date -d "today $${BACKUP_TIME:-03:00}" +%s)
+          [ "$$n" -gt "$$(date +%s)" ] || n=$$(date -d "tomorrow $${BACKUP_TIME:-03:00}" +%s)
+          log "다음 백업: $$(date -d "@$$n" '+%F %T')"; next=$$n
+        }
         until pg_isready -q; do sleep 2; done
-        wal-g backup-list 2>/dev/null | grep -q '^base_' || backup 전체 --full
+        wal-g backup-list 2>/dev/null | grep -q '^base_' || backup
+        next_run
         while true; do
-          at="$${BACKUP_TIME:-03:00}"
-          next=$$(date -d "today $$at" +%s)
-          [ "$$next" -gt "$$(date +%s)" ] || next=$$(date -d "tomorrow $$at" +%s)
-          echo "다음 백업: $$(date -d "@$$next" '+%F %T')"
-          sleep $$(( next - $$(date +%s) ))
-          if [ "$$(date +%u)" = "$${BACKUP_FULL_WEEKDAY:-7}" ]; then backup 전체 --full; else backup 증분; fi
+          if [ "$$(date +%s)" -ge "$$next" ]; then backup; next_run; fi
+          check_archive
+          check_stale
+          s=$$(( $$next - $$(date +%s) )); [ "$$s" -le 300 ] || s=300
+          sleep $$(( s > 0 ? s : 1 ))
         done
 
   keygen-redis:

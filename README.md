@@ -113,19 +113,22 @@ portal은 API 호출이 실패하면 이 문구를 보여줍니다. 대부분 AP
 
 ## DB 백업
 
-`keygen-postgres`는 공식 `postgres:17.5`에 WAL-G를 더한 이미지입니다(compose 안의 Dockerfile). WAL을 S3 호환 저장소(RustFS)에 올립니다.
-`keygen-backup`은 매일 `BACKUP_TIME`에 백업을 돌립니다. `BACKUP_FULL_WEEKDAY`에는 전체, 나머지 날에는 증분이고, 끝나면 오래된 백업을 정리하고 웹훅으로 알립니다.
-설정은 전부 서버의 `.env.backup`입니다. [`backup.env.example`](backup.env.example)을 복사해 채웁니다.
+[WAL-G 공식 문서](https://github.com/wal-g/wal-g/blob/master/docs/PostgreSQL.md) 방식 그대로 씁니다.
+
+- `keygen-postgres`: 공식 `postgres:17.5`에 WAL-G v3.0.10 실행 파일을 더한 이미지(compose 안의 Dockerfile, 체크섬 고정). `archive_command`로 WAL을 S3 호환 저장소(RustFS)에 올립니다.
+- `keygen-backup`: 매일 `BACKUP_TIME`에 `backup-push`. 증분이 `WALG_DELTA_MAX_STEPS`번 쌓이면 다음은 자동으로 전체입니다. 끝나면 `delete retain FULL`로 정리하고 웹훅으로 알립니다.
+- 알림(웹훅): 백업 성공·실패, WAL 업로드 실패(`pg_stat_archiver`, 5분마다 확인), `BACKUP_MAX_AGE_HOURS`(기본 26시간) 넘게 성공한 백업 없음. 문제가 풀리면 한 번 더 알립니다.
+- 설정은 전부 서버의 `.env.backup`입니다. [`backup.env.example`](backup.env.example)을 복사해 채웁니다. 다른 서버에서는 이 파일만 바꿉니다(`WALG_S3_PREFIX`는 서버마다 다르게).
 
 ### 처음 적용 (운영 중인 DB에도 같음)
 
 데이터 볼륨과 Postgres 버전은 그대로이고, 설정 적용을 위해 Postgres가 한 번 재시작됩니다(몇 초).
 
-1. RustFS에 버킷과, 그 경로만 쓸 수 있는 백업 전용 키를 만듭니다.
+1. RustFS에 버킷과, 그 경로만 쓸 수 있는 백업 전용 키를 만듭니다. 버킷 수명 주기 규칙을 쓴다면 `backup_reservations/`는 빼 둡니다.
 2. `.env.backup`을 채웁니다. `WALG_LIBSODIUM_KEY`는 `openssl rand -hex 32`로 만들고 **비밀번호 관리자에도 보관**합니다. Keygen `.env`의 `ENCRYPTION_*`·`SECRET_KEY_BASE`도 함께 보관합니다. 이 값들이 없으면 백업이 있어도 복원할 수 없습니다.
 3. `DOT_ENV_BACKUP` 시크릿을 등록합니다(`base64 -w0 .env.backup`).
 4. 만약을 위해 서버에서 덤프를 받아 둡니다: `docker compose -f docker-compose.noaled.yaml exec -T keygen-postgres pg_dump -U <POSTGRES_USER> -Fc <POSTGRES_DB> > before-walg.dump`
-5. 배포 워크플로를 실행합니다. `keygen-backup` 로그에 `전체 백업 성공`이 나오면 끝입니다.
+5. 배포 워크플로를 실행합니다. `keygen-backup` 로그에 `DB 백업 성공`이 나오면 끝입니다.
 
 ### 명령
 
@@ -133,28 +136,42 @@ portal은 API 호출이 실패하면 이 문구를 보여줍니다. 대부분 AP
 C="docker compose -f docker-compose.noaled.yaml"
 $C logs --tail=50 keygen-backup
 $C exec keygen-backup wal-g backup-list --detail
-$C exec keygen-backup wal-g backup-push /var/lib/postgresql/data --full   # 지금 전체 백업
-$C exec keygen-postgres psql -U <POSTGRES_USER> -c "select archived_count, failed_count from pg_stat_archiver"   # WAL 업로드 상태
+$C exec keygen-backup wal-g backup-push /var/lib/postgresql/data --full --wait-for-archive   # 지금 전체 백업
+$C exec keygen-backup wal-g wal-verify integrity timeline   # 저장소의 WAL이 끊김 없이 있는지
+$C exec keygen-postgres psql -U <POSTGRES_USER> -c "select * from pg_stat_archiver"   # WAL 업로드 상태
 ```
 
 ### 복원
 
-빈 볼륨에 받은 뒤 Postgres를 시작하면 WAL을 받아 복구를 마칩니다. 시점 복원은 마지막으로 올라간 WAL까지만 됩니다(장애 직전 최대 5분은 잃을 수 있음).
+빈 볼륨에 마지막 백업을 받고(`backup-fetch`), `recovery.signal`과 `restore_command`를 넣고 Postgres를 시작하면 저장소의 WAL을 끝까지 적용한 뒤 열립니다.
+마지막으로 올라간 WAL까지만 복구됩니다(장애 직전 최대 5분은 잃을 수 있음). 볼륨 이름 `keygen_postgres`는 배포 폴더 이름(`keygen`)을 따릅니다.
 
 ```bash
+C="docker compose -f docker-compose.noaled.yaml"
 $C stop keygen-api keygen-worker keygen-backup keygen-postgres
-# 기존 postgres 볼륨은 지우지 말고 보관한 뒤, 빈 볼륨에서:
-$C run --rm --no-deps -u postgres --entrypoint bash keygen-postgres -c '
-  wal-g backup-fetch "$PGDATA" LATEST &&
-  echo "restore_command = '"'"'wal-g wal-fetch %f %p'"'"'" >> "$PGDATA/postgresql.auto.conf" &&
-  touch "$PGDATA/recovery.signal"'
-# 특정 시각까지만: 위 echo 뒤에 recovery_target_time = '2026-11-26 14:30:00+09' 와 recovery_target_action = 'promote' 를 더 넣는다
+# 1) 기존 볼륨은 지우지 말고 keygen_postgres_old로 복사해 보관한 뒤 비운다
+docker run --rm -v keygen_postgres:/from -v keygen_postgres_old:/to postgres:17.5 cp -a /from/. /to/
+$C rm -f keygen-postgres keygen-backup && docker volume rm keygen_postgres
+# 2) 마지막 백업(증분이면 딸린 전체까지)을 받고 복구 설정을 넣는다
+$C run --rm -T --no-deps -u postgres --entrypoint bash keygen-postgres -s <<'EOF'
+set -e
+wal-g backup-fetch "$PGDATA" LATEST
+# wal-fetch는 WAL이 없으면 74(복구 끝). 그 밖의 오류(S3 장애 등)는 255로 바꿔 Postgres가 멈추게 한다
+cat >> "$PGDATA/postgresql.auto.conf" <<'CONF'
+restore_command = 'wal-g wal-fetch %f %p || { [ $? -eq 74 ] && exit 1; exit 255; }'
+CONF
+# 특정 시각까지만: 위 CONF 안에 recovery_target_time = '2026-11-26 14:30:00+09' 과 recovery_target_action = 'promote' 를 더 넣는다
+touch "$PGDATA/recovery.signal"
+EOF
+# 3) 시작하면 WAL을 적용하고 열린다 (logs keygen-postgres에 "archive recovery complete")
 $C up -d
+# 4) 복원한 DB의 새 전체 백업을 바로 만든다
+$C exec keygen-backup wal-g backup-push /var/lib/postgresql/data --full --wait-for-archive
 ```
 
 복원 시험은 운영 볼륨 대신 임시 볼륨에 받아서 합니다. 이때 Postgres는 `-c archive_mode=off`로 띄웁니다. 그래야 복원한 DB가 운영 저장소에 WAL을 올리지 않습니다.
 
-**주의**: 경로(`WALG_S3_PREFIX`) 하나에는 DB 하나만 백업합니다. `keygen:setup`으로 DB를 새로 만들었거나 다른 서버라면 새 경로를 씁니다.
+**주의**: 경로(`WALG_S3_PREFIX`) 하나에는 DB 하나만 백업합니다. `keygen:setup`으로 DB를 새로 만들었거나, 다른 서버이거나, Postgres 메이저 버전을 올렸다면 새 경로를 씁니다.
 
 ## 개발 / 테스트
 
