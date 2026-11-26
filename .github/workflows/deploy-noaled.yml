@@ -41,14 +41,16 @@ jobs:
             set -e
             cd "$DEPLOY_DIR"
             (umask 077 && printf '%s' "$DOT_ENV" | base64 -d > .env)
-            # 백업 설정 (BACKUP.md). 없으면 WAL을 올릴 수 없으므로 배포를 멈춘다.
+            # DB 백업 설정 (README "DB 백업"). 없으면 WAL을 올릴 수 없으므로 배포를 멈춘다.
             if [ -z "$DOT_ENV_BACKUP" ]; then
               echo "DOT_ENV_BACKUP 시크릿이 없습니다 (backup.env.example 참고)" >&2
               exit 1
             fi
             (umask 077 && printf '%s' "$DOT_ENV_BACKUP" | base64 -d > .env.backup)
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            docker compose -f docker-compose.noaled.yaml pull
+            # keygen-postgres 이미지(postgres + WAL-G)는 compose 안의 Dockerfile로 서버에서 빌드한다.
+            docker compose -f docker-compose.noaled.yaml pull --ignore-buildable
+            docker compose -f docker-compose.noaled.yaml build
             docker compose -f docker-compose.noaled.yaml run --rm keygen-migrate
             docker compose -f docker-compose.noaled.yaml up -d --remove-orphans
             docker image prune -f

@@ -12,9 +12,7 @@
 | [`docker-compose.noaled.yaml`](docker-compose.noaled.yaml) | 운영 compose (api, worker, postgres, redis, portal + setup/console/migrate 프로필) |
 | [`noaled.env.example`](noaled.env.example) | 서버 `.env` 템플릿 |
 | [`backup.env.example`](backup.env.example) | 서버 `.env.backup` 템플릿 (DB 백업: S3 · 암호화 · 일정 · 알림) |
-| [`BACKUP.md`](BACKUP.md) | DB 백업 (WAL-G → RustFS) 구성 · 처음 적용 · 복원 |
 | [`.github/workflows/deploy-noaled.yml`](.github/workflows/deploy-noaled.yml) | 배포 워크플로 (수동 실행) |
-| [`.github/workflows/build-postgres.yml`](.github/workflows/build-postgres.yml) | Postgres + WAL-G 이미지 빌드 (`backup/postgres` 변경 시) |
 | [`.github/workflows/test.yml`](.github/workflows/test.yml) | 원본 CI (push/PR 시 자동 실행) |
 
 ## 구성
@@ -26,7 +24,7 @@
                                      ├─ keygen-postgres ── WAL · 백업 ─▶ RustFS (S3)
                                      └─ keygen-redis
                                   keygen-worker (sidekiq)
-                                  keygen-backup (예약 백업, BACKUP.md)
+                                  keygen-backup (예약 백업, 아래 "DB 백업")
 ```
 
 - 리버스 프록시는 이 저장소 밖에서 관리하며, 외부 Docker 네트워크 `app`을 미리 만들어 둬야 합니다.
@@ -43,7 +41,7 @@ GitHub Actions → **Deploy with Docker Compose** → **Run workflow** (수동 �
 1. `docker-compose.noaled.yaml`을 서버 `/home/<REMOTE_USER>/keygen`으로 복사
 2. `DOT_ENV`·`DOT_ENV_BACKUP` 시크릿을 base64 디코드해서 `.env`·`.env.backup` 생성 (권한 600)
 3. `GITHUB_TOKEN`으로 `ghcr.io` 로그인
-4. `pull` → `run --rm keygen-migrate` → `up -d --remove-orphans` → `image prune`
+4. `pull --ignore-buildable` → `build`(keygen-postgres: postgres + WAL-G) → `run --rm keygen-migrate` → `up -d --remove-orphans` → `image prune`
 
 ### 필요한 Repository Secrets
 
@@ -53,7 +51,7 @@ GitHub Actions → **Deploy with Docker Compose** → **Run workflow** (수동 �
 | `REMOTE_USER` | SSH 사용자 (배포 경로가 `/home/<REMOTE_USER>/keygen`이 됨) |
 | `REMOTE_SSH_KEY` | SSH 개인키 |
 | `DOT_ENV` | 서버 `.env` 전체를 base64 인코딩한 값 (`base64 -w0 .env`) |
-| `DOT_ENV_BACKUP` | 서버 `.env.backup` 전체를 base64 인코딩한 값 (`base64 -w0 .env.backup`). 없으면 배포가 멈춤 ([BACKUP.md](BACKUP.md)) |
+| `DOT_ENV_BACKUP` | 서버 `.env.backup` 전체를 base64 인코딩한 값 (`base64 -w0 .env.backup`). 없으면 배포가 멈춤 ([DB 백업](#db-백업)) |
 
 `.env`는 `noaled.env.example`을 복사해서 채웁니다. `KEYGEN_ACCOUNT_ID`는 portal 빌드에 들어간 ID와 같아야 합니다.
 
@@ -112,6 +110,51 @@ portal은 API 호출이 실패하면 이 문구를 보여줍니다. 대부분 AP
 ### `keygen-worker`가 `Restarting`
 
 대부분 API와 같은 원인(계정 미생성, `.env` 누락)입니다. `logs keygen-worker`로 확인하세요.
+
+## DB 백업
+
+`keygen-postgres`는 공식 `postgres:17.5`에 WAL-G를 더한 이미지입니다(compose 안의 Dockerfile). WAL을 S3 호환 저장소(RustFS)에 올립니다.
+`keygen-backup`은 매일 `BACKUP_TIME`에 백업을 돌립니다. `BACKUP_FULL_WEEKDAY`에는 전체, 나머지 날에는 증분이고, 끝나면 오래된 백업을 정리하고 웹훅으로 알립니다.
+설정은 전부 서버의 `.env.backup`입니다. [`backup.env.example`](backup.env.example)을 복사해 채웁니다.
+
+### 처음 적용 (운영 중인 DB에도 같음)
+
+데이터 볼륨과 Postgres 버전은 그대로이고, 설정 적용을 위해 Postgres가 한 번 재시작됩니다(몇 초).
+
+1. RustFS에 버킷과, 그 경로만 쓸 수 있는 백업 전용 키를 만듭니다.
+2. `.env.backup`을 채웁니다. `WALG_LIBSODIUM_KEY`는 `openssl rand -hex 32`로 만들고 **비밀번호 관리자에도 보관**합니다. Keygen `.env`의 `ENCRYPTION_*`·`SECRET_KEY_BASE`도 함께 보관합니다. 이 값들이 없으면 백업이 있어도 복원할 수 없습니다.
+3. `DOT_ENV_BACKUP` 시크릿을 등록합니다(`base64 -w0 .env.backup`).
+4. 만약을 위해 서버에서 덤프를 받아 둡니다: `docker compose -f docker-compose.noaled.yaml exec -T keygen-postgres pg_dump -U <POSTGRES_USER> -Fc <POSTGRES_DB> > before-walg.dump`
+5. 배포 워크플로를 실행합니다. `keygen-backup` 로그에 `전체 백업 성공`이 나오면 끝입니다.
+
+### 명령
+
+```bash
+C="docker compose -f docker-compose.noaled.yaml"
+$C logs --tail=50 keygen-backup
+$C exec keygen-backup wal-g backup-list --detail
+$C exec keygen-backup wal-g backup-push /var/lib/postgresql/data --full   # 지금 전체 백업
+$C exec keygen-postgres psql -U <POSTGRES_USER> -c "select archived_count, failed_count from pg_stat_archiver"   # WAL 업로드 상태
+```
+
+### 복원
+
+빈 볼륨에 받은 뒤 Postgres를 시작하면 WAL을 받아 복구를 마칩니다. 시점 복원은 마지막으로 올라간 WAL까지만 됩니다(장애 직전 최대 5분은 잃을 수 있음).
+
+```bash
+$C stop keygen-api keygen-worker keygen-backup keygen-postgres
+# 기존 postgres 볼륨은 지우지 말고 보관한 뒤, 빈 볼륨에서:
+$C run --rm --no-deps -u postgres --entrypoint bash keygen-postgres -c '
+  wal-g backup-fetch "$PGDATA" LATEST &&
+  echo "restore_command = '"'"'wal-g wal-fetch %f %p'"'"'" >> "$PGDATA/postgresql.auto.conf" &&
+  touch "$PGDATA/recovery.signal"'
+# 특정 시각까지만: 위 echo 뒤에 recovery_target_time = '2026-11-26 14:30:00+09' 와 recovery_target_action = 'promote' 를 더 넣는다
+$C up -d
+```
+
+복원 시험은 운영 볼륨 대신 임시 볼륨에 받아서 합니다. 이때 Postgres는 `-c archive_mode=off`로 띄웁니다. 그래야 복원한 DB가 운영 저장소에 WAL을 올리지 않습니다.
+
+**주의**: 경로(`WALG_S3_PREFIX`) 하나에는 DB 하나만 백업합니다. `keygen:setup`으로 DB를 새로 만들었거나 다른 서버라면 새 경로를 씁니다.
 
 ## 개발 / 테스트
 

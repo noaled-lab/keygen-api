@@ -1,4 +1,1 @@
 /VERSION ident
-# 이미지에 들어가는 셸 스크립트는 Windows에서 체크아웃해도 LF로 둔다 (CRLF면 컨테이너에서 실행되지 않는다).
-backup/postgres/bin/* text eol=lf
-backup/postgres/Dockerfile text eol=lf
